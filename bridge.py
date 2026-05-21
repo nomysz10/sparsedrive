@@ -4,7 +4,6 @@ Integruje model SparseDrive z symulatorem BeamNG.tech:
 - SparseDriveBridge: ładuje model, uruchamia inferencję
 - InputBuilder: konwertuje obrazy BeamNG do formatu nuScenes
 - ControlExtractor: wyciąga steering/throttle/brake z trajektorii (Pure Pursuit)
-- FallbackPerception: awaryjna percepcja gdy model niedostępny
 """
 import time
 import math
@@ -31,189 +30,6 @@ from config import (
 
 
 # ==============================================================================
-# FALLBACK PERCEPTION — gdy model SparseDrive niedostępny
-# ==============================================================================
-
-class FallbackPerception:
-    """Klasyczna percepcja z 6 kamer jako fallback.
-
-    Wykrywa: pasy ruchu (Canny+Hough), pojazdy (kontury+kolor), wolną przestrzeń.
-    Używane tylko gdy model SparseDrive nie może być załadowany.
-    """
-
-    def __init__(self):
-        self._detected_vehicles = []
-        self._lane_center = None
-        self._road_edges = None
-
-    def process(self, images: dict, vehicle_yaw: float):
-        """Przetwarza obrazy z 6 kamer i zwraca wyniki w formacie zbliżonym do SparseDrive.
-
-        Returns:
-            dict z kluczami: boxes_3d, vectors, final_planning, lane_available
-        """
-        front = images.get('F')
-        if front is None:
-            return self._empty_result()
-
-        h, w = front.shape[:2]
-
-        # 1. Wykrywanie pasów z przedniej kamery
-        lane_center, left_xs, right_xs = self._detect_lanes(front)
-
-        # 2. Wykrywanie pojazdów na wszystkich kamerach
-        vehicles = []
-        for cam_key, img in images.items():
-            if img is not None:
-                vhs = self._detect_vehicles_in_image(img, cam_key)
-                vehicles.extend(vhs)
-
-        # 3. Sprawdzenie wolnych pasów
-        lane_left_free = self._check_lane_free(vehicles, 'left')
-        lane_right_free = self._check_lane_free(vehicles, 'right')
-
-        # 4. Generowanie trajektorii (prosta lub skręt)
-        planning_traj = self._generate_trajectory(lane_center, w, h)
-
-        return {
-            'boxes_3d': np.array(vehicles) if vehicles else np.zeros((0, 7)),
-            'vectors': None,
-            'final_planning': np.array(planning_traj),
-            'lane_available': {'left': lane_left_free, 'right': lane_right_free},
-            'obstacle_ahead': self._check_obstacle_ahead(vehicles),
-            'obstacle_distance': self._get_obstacle_distance(vehicles),
-        }
-
-    def _detect_lanes(self, img_bgr):
-        """Ulepszone wykrywanie pasów (Canny + Hough + polyfit)."""
-        h, w = img_bgr.shape[:2]
-        roi_top = int(h * 0.55)
-        roi = img_bgr[roi_top:h, 0:w]
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 50, 150)
-
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30,
-                                minLineLength=30, maxLineGap=50)
-
-        left_pts = []
-        right_pts = []
-
-        if lines is not None:
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                if x1 == x2:
-                    continue
-                slope = (y2 - y1) / (x2 - x1)
-                if abs(slope) < 0.3:
-                    continue
-
-                if slope < -0.3:  # Lewy pas
-                    left_pts.extend([(x1, y1), (x2, y2)])
-                elif slope > 0.3:  # Prawy pas
-                    right_pts.extend([(x1, y1), (x2, y2)])
-
-        roi_h = h - roi_top
-        left_x = None
-        right_x = None
-
-        if len(left_pts) >= 4:
-            left_pts_arr = np.array(left_pts)
-            coeffs = np.polyfit(left_pts_arr[:, 1], left_pts_arr[:, 0], 2)
-            left_x = np.polyval(coeffs, roi_h // 2)
-
-        if len(right_pts) >= 4:
-            right_pts_arr = np.array(right_pts)
-            coeffs = np.polyfit(right_pts_arr[:, 1], right_pts_arr[:, 0], 2)
-            right_x = np.polyval(coeffs, roi_h // 2)
-
-        if left_x is not None and right_x is not None:
-            lane_center = (left_x + right_x) / 2.0
-        elif left_x is not None:
-            lane_center = left_x + 60
-        elif right_x is not None:
-            lane_center = right_x - 60
-        else:
-            lane_center = w / 2.0
-
-        return lane_center, left_x, right_x
-
-    def _detect_vehicles_in_image(self, img_bgr, cam_key):
-        """Wykrywa pojazdy na pojedynczej kamerze (kontury + kolor)."""
-        h, w = img_bgr.shape[:2]
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (7, 7), 0)
-        edges = cv2.Canny(blur, 40, 120)
-
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        vehicles = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 400:  # za małe
-                continue
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            aspect = bh / (bw + 0.001)
-            if 0.5 < aspect < 2.5:  # proporcje auta
-                # Przybliżona pozycja 3D względem ego
-                rel_x = (x - w / 2) / w * 20  # ±10m
-                rel_y = -(y / h) * 30 - 5     # odległość
-                rel_w = bw / w * 6
-                rel_h = bh / h * 6
-                vehicles.append([rel_x, rel_y, 0, rel_w, rel_h, 1.5, 0])
-
-        return vehicles
-
-    def _check_lane_free(self, vehicles, direction):
-        """Sprawdza czy sąsiedni pas jest wolny."""
-        if not vehicles:
-            return True
-        offset = -LANE_WIDTH if direction == 'left' else LANE_WIDTH
-        for v in vehicles:
-            vx = v[0]
-            if abs(vx - offset) < LANE_WIDTH and v[1] > -10:
-                return False
-        return True
-
-    def _check_obstacle_ahead(self, vehicles):
-        """Sprawdza czy przed nami jest przeszkoda."""
-        for v in vehicles:
-            if abs(v[0]) < 2.0 and -15 < v[1] < 0:
-                return True
-        return False
-
-    def _get_obstacle_distance(self, vehicles):
-        """Zwraca odległość do najbliższej przeszkody."""
-        min_dist = 100.0
-        for v in vehicles:
-            if abs(v[0]) < 2.0 and v[1] < 0:
-                dist = abs(v[1])
-                if dist < min_dist:
-                    min_dist = dist
-        return min_dist if min_dist < 100 else None
-
-    def _generate_trajectory(self, lane_center, img_w, img_h):
-        """Generuje prostą trajektorię 6 punktów (3s horyzont)."""
-        error = (lane_center - img_w / 2) / (img_w / 2)  # -1..1
-        points = []
-        for t in range(6):
-            x = error * t * 0.5
-            y = t * 3.0  # 3m na krok = 18m zasięg
-            points.append([x, y])
-        return points
-
-    def _empty_result(self):
-        return {
-            'boxes_3d': np.zeros((0, 7)),
-            'vectors': None,
-            'final_planning': np.array([[0, 3], [0, 6], [0, 9], [0, 12], [0, 15], [0, 18]]),
-            'lane_available': {'left': True, 'right': True},
-            'obstacle_ahead': False,
-            'obstacle_distance': None,
-        }
-
-
-# ==============================================================================
 # INPUT BUILDER — konwersja obrazów BeamNG do formatu modelu
 # ==============================================================================
 
@@ -222,8 +38,8 @@ class InputBuilder:
 
     def __init__(self):
         self.input_shape = INPUT_SHAPE  # (704, 256) - (w, h)
-        self.mean = torch.tensor(IMG_NORM_MEAN, dtype=torch.float32).view(1, 1, 1, 3)
-        self.std = torch.tensor(IMG_NORM_STD, dtype=torch.float32).view(1, 1, 1, 3)
+        self.mean = torch.tensor(IMG_NORM_MEAN, dtype=torch.float32).view(1, 1, 3)
+        self.std = torch.tensor(IMG_NORM_STD, dtype=torch.float32).view(1, 1, 3)
 
     def build(self, images_6cam: dict, vehicle_state: dict, command: int):
         """Konwertuje obrazy BeamNG na tensor wejściowy modelu.
@@ -269,7 +85,7 @@ class InputBuilder:
         return {
             'img': img_batch,
             'projection_mat': projection_mat,
-            'image_wh': (self.input_shape[0], self.input_shape[1]),
+            'image_wh': torch.tensor([[self.input_shape] * 6], dtype=torch.float32),
             'ego_status': ego_status,
             'gt_ego_fut_cmd': gt_ego_fut_cmd,
         }
@@ -515,79 +331,91 @@ class ControlExtractor:
 # ==============================================================================
 
 class SparseDriveBridge:
-    """Ładuje model SparseDrive i udostępnia inferencję.
+    """Ładuje model SparseDrive i udostępnia inferencję end-to-end.
 
-    Jeśli model nie może być załadowany (brak mmcv, checkpointów, CUDA ops),
-    używa FallbackPerception.
+    Model SparseDrive (Stage 2): 6 kamer → detekcja 3D + mapy + predykcja ruchu + planowanie.
     """
 
     def __init__(self, config_path=None, checkpoint_path=None):
         self.model = None
-        self.use_fallback = True
-        self.fallback = FallbackPerception()
         self.input_builder = InputBuilder()
         self.control_extractor = ControlExtractor()
         self._temporal_queue = deque(maxlen=QUEUE_LENGTH)
-        self._model_loaded = False
 
-        # Próbuj załadować model SparseDrive
-        if config_path and checkpoint_path:
-            self._try_load_model(config_path, checkpoint_path)
+        if not config_path or not checkpoint_path:
+            raise RuntimeError("SparseDriveBridge wymaga config_path i checkpoint_path.")
+
+        self._try_load_model(config_path, checkpoint_path)
 
     def _try_load_model(self, config_path, checkpoint_path):
         """Ładuje model SparseDrive z mmcv-full 1.7.1."""
+        import sys
+        import os
+
+        sparsedrive_dir = os.path.join(os.path.dirname(__file__), 'SparseDrive-main')
+        sys.path.insert(0, sparsedrive_dir)
+        sys.path.insert(0, os.path.join(sparsedrive_dir, 'projects'))
+
+        # Import MUST happen before build_detector — rejestruje klasę w DETECTORS.
+        # mmdet3d_plugin.__init__ importuje datasets które konfliktują z mmdet.
+        # Patch registry żeby ignorował duplikaty zamiast crashować.
+        from mmcv.utils import Registry
+        _orig_register = Registry._register_module
+        def _safe_register(self, module, module_name=None, force=False):
+            try:
+                return _orig_register(self, module, module_name, force)
+            except KeyError:
+                pass  # już zarejestrowane — ignoruj
+        Registry._register_module = _safe_register
+
+        from mmdet3d_plugin.models import SparseDrive as _SD
+        from mmcv import Config
+        from mmdet.models import build_detector
+
+        print(f"[BRIDGE] Ładowanie konfiguracji: {config_path}")
+        cfg = Config.fromfile(config_path)
+
+        # Konfig używa ścieżek relatywnych (data/kmeans/, ckpt/) — trzeba być w katalogu SparseDrive
+        _prev_cwd = os.getcwd()
+        os.chdir(sparsedrive_dir)
         try:
-            import sys
-            import os
-
-            sparsedrive_dir = os.path.join(os.path.dirname(__file__), 'SparseDrive-main')
-            sys.path.insert(0, sparsedrive_dir)
-            sys.path.insert(0, os.path.join(sparsedrive_dir, 'projects'))
-
-            from mmcv import Config
-            from mmdet.models import build_detector
-
-            print(f"[BRIDGE] Ładowanie konfiguracji: {config_path}")
-            cfg = Config.fromfile(config_path)
-
             print("[BRIDGE] Budowanie modelu...")
             self.model = build_detector(cfg.model)
-            self.model.eval()
-            self.model.cuda()
+        finally:
+            os.chdir(_prev_cwd)
+        self.model.eval()
+        self.model.cuda()
 
-            if os.path.exists(checkpoint_path):
-                print(f"[BRIDGE] Ładowanie checkpointu: {checkpoint_path}")
-                checkpoint = torch.load(checkpoint_path, map_location='cuda')
-                state_dict = checkpoint.get('state_dict', checkpoint)
-                # Usuń prefix 'module.' jeśli model był trenowany na wielu GPU
-                cleaned = {k.replace('module.', ''): v for k, v in state_dict.items()}
-                missing, unexpected = self.model.load_state_dict(cleaned, strict=False)
-                if missing:
-                    print(f"[BRIDGE] Brakujące klucze: {len(missing)}")
-                if unexpected:
-                    print(f"[BRIDGE] Niespodziewane klucze: {len(unexpected)}")
-                print(f"[BRIDGE] Model SparseDrive załadowany pomyślnie!")
-            else:
-                print(f"[BRIDGE] Checkpoint nie znaleziony: {checkpoint_path}")
-                print("[BRIDGE] Model będzie używał losowych wag (niska jakość).")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint nie znaleziony: {checkpoint_path}\n"
+                f"Pobierz sparsedrive_stage2.pth z:\n"
+                f"https://github.com/swc-17/SparseDrive/releases/download/v1.0/sparsedrive_stage2.pth"
+            )
 
-            self.use_fallback = False
-            self._model_loaded = True
-            print("[BRIDGE] SparseDrive inference engine GOTOWY.")
-
-        except ImportError as e:
-            print(f"[BRIDGE] Brak zależności ({e}) — używam fallback percepcji.")
-            self.use_fallback = True
-        except Exception as e:
-            print(f"[BRIDGE] Błąd ładowania modelu: {e}")
-            import traceback
-            traceback.print_exc()
-            print("[BRIDGE] Używam fallback percepcji.")
-            self.use_fallback = True
+        print(f"[BRIDGE] Ładowanie checkpointu: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cuda')
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        cleaned = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        # Pomijamy anchory — checkpoint ma inne kształty niż nasza konfiguracja
+        # (anchory to tylko inicjalne pozycje zapytań, model je adaptuje)
+        cleaned = {k: v for k, v in cleaned.items()
+                   if 'motion_anchor' not in k and 'plan_anchor' not in k}
+        missing, unexpected = self.model.load_state_dict(cleaned, strict=False)
+        if missing:
+            plan_missing = [k for k in missing if 'plan' in k or 'motion' in k]
+            det_missing = [k for k in missing if 'det' in k]
+            other_missing = [k for k in missing if 'plan' not in k and 'motion' not in k and 'det' not in k]
+            print(f"[BRIDGE] Brakujące klucze: {len(missing)} "
+                  f"(det:{len(det_missing)} plan/motion:{len(plan_missing)} other:{len(other_missing)})")
+        if unexpected:
+            print(f"[BRIDGE] Niespodziewane klucze: {len(unexpected)}")
+        print(f"[BRIDGE] Model SparseDrive załadowany pomyślnie!")
+        print("[BRIDGE] SparseDrive inference engine GOTOWY.")
 
     def process_frame(self, images_6cam: dict, vehicle_state: dict,
                       command: int, cmd_system=None):
-        """Przetwarza jedną klatkę: obrazy → model → sterowanie.
+        """Przetwarza jedną klatkę: obrazy → model SparseDrive → sterowanie.
 
         Args:
             images_6cam: dict z 6 obrazami kamer (OpenCV BGR)
@@ -598,14 +426,11 @@ class SparseDriveBridge:
         Returns:
             (steering, throttle, brake, results, trajectory_2d, target_speed)
         """
-        if self.use_fallback:
-            results = self.fallback.process(images_6cam, 0)
-        else:
-            input_dict = self.input_builder.build(images_6cam, vehicle_state, command)
-            img = input_dict['img'].cuda()
-            with torch.no_grad(), torch.cuda.amp.autocast():
-                outputs = self.model.simple_test(img, **{k: v for k, v in input_dict.items() if k != 'img'})
-            results = outputs[0].get('img_bbox', {}) if outputs else {}
+        input_dict = self.input_builder.build(images_6cam, vehicle_state, command)
+        img = input_dict['img'].cuda()
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            outputs = self.model.simple_test(img, **{k: v for k, v in input_dict.items() if k != 'img'})
+        results = outputs[0].get('img_bbox', {}) if outputs else {}
 
         steering, throttle, brake, traj_2d, target_speed = \
             self.control_extractor.extract(results, vehicle_state.get('speed_ms', 10), cmd_system)
@@ -616,14 +441,14 @@ class SparseDriveBridge:
         """Sprawdza czy zmiana pasa w danym kierunku jest bezpieczna.
 
         Args:
-            results: wyniki z modelu
+            results: wyniki z modelu SparseDrive (detekcje 3D + mapy)
             direction: -1 (lewo) lub +1 (prawo)
 
         Returns:
             bool: True jeśli pas jest wolny i istnieje
         """
         if results is None:
-            return True  # Fallback: zakładamy że można
+            return True
 
         # Sprawdź mapy (czy istnieje pas)
         map_vectors = results.get('vectors', None)
@@ -631,12 +456,12 @@ class SparseDriveBridge:
             lane_exists = False
             for i, vec in enumerate(map_vectors):
                 label = results['labels'][i]
-                if label == 1:  # divider — linia między pasami
+                if label == 1:  # divider
                     pts = vec
-                    if direction == -1:  # lewy pas
+                    if direction == -1:
                         if np.any(pts[:, 0] > 2.0):
                             lane_exists = True
-                    else:  # prawy pas
+                    else:
                         if np.any(pts[:, 0] < -2.0):
                             lane_exists = True
             if not lane_exists:
@@ -648,6 +473,6 @@ class SparseDriveBridge:
             offset = -LANE_WIDTH if direction == -1 else LANE_WIDTH
             for det in detections:
                 if abs(det[0] - offset) < LANE_WIDTH and abs(det[1]) < 20:
-                    return False  # Auto na sąsiednim pasie
+                    return False
 
         return True

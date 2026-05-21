@@ -35,7 +35,7 @@ from config import (
 )
 from bridge import SparseDriveBridge
 from navigation import CommandSystem
-from visualization import CameraWindow, BEVWindow, ControlPanel
+from visualization import SparseDriveUI
 
 
 # ==============================================================================
@@ -89,7 +89,7 @@ def init_cameras(bng, vehicle):
             pos=cfg['pos'], dir=cfg['dir'],
             **cam_args
         )
-        print(f"  {key}: {cfg['name']} → pos={cfg['pos']}, dir={cfg['dir']}")
+        print(f"  {key}: {cfg['name']} -> pos={cfg['pos']}, dir={cfg['dir']}")
 
     return cameras_dict
 
@@ -226,15 +226,13 @@ def main():
     config_path = os.path.join(os.path.dirname(__file__), SPARSEDRIVE_CONFIG)
     checkpoint_path = os.path.join(os.path.dirname(__file__), SPARSEDRIVE_CHECKPOINT)
     bridge = SparseDriveBridge(config_path, checkpoint_path)
-    print(f"[SYSTEM] Bridge gotowy (fallback={'TAK' if bridge.use_fallback else 'NIE'})")
+    print("[SYSTEM] Bridge gotowy (SparseDrive Stage 2 end-to-end)")
 
     # 4. Inicjalizacja nawigacji
     cmd_system = CommandSystem()
 
     # 5. Inicjalizacja wizualizacji
-    cam_window = CameraWindow()
-    bev_window = BEVWindow()
-    ctrl_panel = ControlPanel()
+    ui = SparseDriveUI()
 
     # 6. Stan
     autopilot_on = False  # Start z wyłączonym autopilotem — użytkownik włącza spacją
@@ -266,18 +264,14 @@ def main():
             vehicle_state = read_vehicle_state(vehicle)
 
             if autopilot_on:
-                # --- Inferencja modelu / fallback ---
+                # --- Inferencja modelu SparseDrive ---
                 steering, throttle, brake, results, trajectory_2d, target_speed = \
                     bridge.process_frame(images, vehicle_state,
                                          cmd_system.current_command, cmd_system)
 
                 # --- Sprawdzenie dostępności pasów ---
-                if not bridge.use_fallback:
-                    lane_left_free = bridge.check_lane_change_safe(results, -1)
-                    lane_right_free = bridge.check_lane_change_safe(results, +1)
-                else:
-                    lane_left_free = results.get('lane_available', {}).get('left', True)
-                    lane_right_free = results.get('lane_available', {}).get('right', True)
+                lane_left_free = bridge.check_lane_change_safe(results, -1)
+                lane_right_free = bridge.check_lane_change_safe(results, +1)
                 lane_change_available = {'left': lane_left_free, 'right': lane_right_free}
 
                 # --- Aktualizacja zawracania ---
@@ -291,16 +285,11 @@ def main():
             vehicle.control(throttle=throttle, steering=steering, brake=brake)
 
             # --- Wizualizacja ---
-            cam_window.render(
+            pressed_btn = ui.render(
                 images, trajectory_2d, vehicle_state['speed_kmh'],
                 steering, frame, cmd_system.current_command,
                 cmd_system.status, autopilot_on, lane_change_available,
-            )
-            bev_window.render(frame, results, vehicle_state,
-                              cmd_system.current_command, cmd_system)
-            pressed_btn = ctrl_panel.render(
-                vehicle_state['speed_kmh'], cmd_system.current_command,
-                cmd_system, autopilot_on,
+                results, vehicle_state, cmd_system,
             )
 
             # --- Obsługa przycisków panelu sterowania ---
@@ -360,9 +349,7 @@ def main():
         traceback.print_exc()
     finally:
         print("[SYSTEM] Zamykanie...")
-        cam_window.close()
-        bev_window.close()
-        ctrl_panel.close()
+        ui.close()
         cv2.destroyAllWindows()
         bng.close()
         print("[SYSTEM] Koniec.")
