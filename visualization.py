@@ -1,17 +1,19 @@
-"""Wizualizacja: 6 kamer (OpenCV), BEV (Matplotlib), Panel sterowania (OpenCV).
+"""Wizualizacja: 6 kamer (OpenCV), BEV (Matplotlib→OpenCV), Panel sterowania (OpenCV).
 
 Adaptuje kod z SparseDrive:
-- bev_render.py → BEVWindow (real-time update zamiast recreate)
+- bev_render.py → BEVWindow (real-time update, renderowane do numpy i pokazywane przez OpenCV)
 - cam_render.py → trajectory_on_front_camera (rzutowanie trajektorii)
+
+Używa backendu 'Agg' dla matplotlib aby uniknąć konfliktów GIL z BeamNGpy.
 """
 import math
 import time
 import cv2
 import numpy as np
 
-# Matplotlib do BEV (jak w SparseDrive)
+# Matplotlib z backendem Agg — bezpieczne wątkowe (brak Tkinter/GIL konfliktów)
 import matplotlib
-matplotlib.use('TkAgg')  # Interaktywny backend dla real-time
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
 
@@ -173,26 +175,36 @@ class CameraWindow:
 
 
 class BEVWindow:
-    """Widok z lotu ptaka (Matplotlib) — adaptowany z SparseDrive BEVRender."""
+    """Widok z lotu ptaka renderowany przez matplotlib (Agg) i wyświetlany przez OpenCV.
+
+    Używa backendu 'Agg' aby uniknąć konfliktów GIL między Tkinter a BeamNGpy.
+    Renderuje figurę do numpy array i pokazuje w oknie OpenCV.
+    """
 
     def __init__(self):
-        self.fig = None
-        self.axes = None
         self.xlim = BEV_XLIM
         self.ylim = BEV_YLIM
         self._last_update_frame = -999
+        self._dpi = 80
+        self._figsize_inches = (8, 8)
+        self._figsize_px = (int(8 * self._dpi), int(8 * self._dpi))  # 640x640
+        self.window_name = "BEV - Bird's Eye View"
         self._setup_canvas()
 
     def _setup_canvas(self):
-        """Inicjalizuje okno matplotlib."""
-        plt.ion()
-        self.fig, self.axes = plt.subplots(1, 1, figsize=(8, 8))
+        """Inicjalizuje figurę matplotlib (Agg backend — bez GUI)."""
+        self.fig, self.axes = plt.subplots(
+            1, 1, figsize=self._figsize_inches, dpi=self._dpi,
+            facecolor='black',
+        )
         self.axes.set_xlim(-self.xlim, self.xlim)
         self.axes.set_ylim(-self.ylim, self.ylim)
         self.axes.set_facecolor('black')
         self.axes.axis('off')
-        self.axes.set_title('BEV - Bird\'s Eye View', color='white', fontsize=14)
-        plt.tight_layout(pad=0)
+        self.fig.tight_layout(pad=0)
+
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, self._figsize_px[0], self._figsize_px[1])
 
     def should_update(self, frame):
         """Sprawdza czy BEV powinien być aktualizowany w tej klatce."""
@@ -217,7 +229,6 @@ class BEVWindow:
         self.axes.set_ylim(-self.ylim, self.ylim)
         self.axes.set_facecolor('black')
         self.axes.axis('off')
-        self.axes.set_title('BEV - Bird\'s Eye View', color='white', fontsize=14)
 
         # Rysuj ego-pojazd (prostokąt oznaczający auto)
         self._draw_ego_vehicle()
@@ -232,18 +243,28 @@ class BEVWindow:
 
         # Rysuj komendę
         cmd_name = CMD_NAMES.get(command, 'Go Straight')
-        self.axes.text(-38, -38, cmd_name, fontsize=18, color='white',
+        self.axes.text(-38, -38, cmd_name, fontsize=14, color='white',
                        bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
 
         # Status
-        self.axes.text(-38, -35, cmd_system.status, fontsize=12, color='lime',
+        self.axes.text(-38, -35, cmd_system.status, fontsize=10, color='lime',
                        bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
 
-        try:
-            self.fig.canvas.draw()
-            self.fig.canvas.flush_events()
-        except Exception:
-            pass
+        # Renderuj figurę do numpy array (Agg → bezpieczne wątkowe)
+        bev_image = self._fig_to_numpy()
+
+        # Pokaż przez OpenCV
+        cv2.imshow(self.window_name, bev_image)
+
+    def _fig_to_numpy(self):
+        """Konwertuje figurę matplotlib na obraz numpy (BGR) dla OpenCV."""
+        self.fig.canvas.draw()
+        # Pobierz buffer jako RGB
+        buf = self.fig.canvas.buffer_rgba()
+        img = np.asarray(buf, dtype=np.uint8)
+        # RGBA → BGR (OpenCV format)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        return img_bgr
 
     def _draw_ego_vehicle(self):
         """Rysuje pojazd ego jako prostokąt."""
@@ -331,7 +352,7 @@ class BEVWindow:
             traj_abs = traj if traj.shape[0] > 1 and abs(traj[0]).sum() < 1 else traj
             # Trajektoria od ego (0,0)
             total_steps = len(traj) * 10
-            dot_colors = matplotlib.colormaps['autumn'](
+            dot_colors = plt.get_cmap('autumn')(
                 np.linspace(0, 1, total_steps))[:, :3]
             for i in range(len(traj)):
                 self.axes.scatter(traj[i][1], traj[i][0], c=[dot_colors[i * 10]],
@@ -367,6 +388,7 @@ class BEVWindow:
     def close(self):
         if self.fig is not None:
             plt.close(self.fig)
+        cv2.destroyWindow(self.window_name)
 
 
 class ControlPanel:
